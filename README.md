@@ -1,6 +1,6 @@
 # Forge Engine
 
-This is a lightweight game engine, which uses raymarching as the primary rendering method. Raymarching allows for unique manipulation of shapes and cool effects which would be complex to implement in non-SDF based engines. It is heavily based on the legendary work of Inigo Quilez (definitely check out their work).
+This is a lightweight graphics engine, which uses raymarching as the primary rendering method. Raymarching allows for unique manipulation of shapes and cool effects which would be complex to implement in non-SDF based engines. Currently, it is intended for design of cool scenes but might one day be extended into a full-blown game engine. It is heavily based on the legendary work of Inigo Quilez (definitely check out their work).
 
 ## Dependencies
 You need to install SDL2 and OpenGL.

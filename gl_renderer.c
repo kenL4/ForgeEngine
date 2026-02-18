@@ -31,7 +31,9 @@ static void camera_basis(const camera_t *cam, float fwd[3], float right[3], floa
 struct gl_renderer {
     int width;
     int height;
-    GLuint program;
+    GLuint compute_program;
+    GLuint display_program;
+    GLuint output_texture;
     GLuint vao;
     GLuint vbo;
     bool ok;
@@ -111,6 +113,42 @@ static GLuint link_program(GLuint vert, GLuint frag)
     return prog;
 }
 
+static GLuint link_compute_program(GLuint comp)
+{
+    GLuint prog = glCreateProgram();
+    glAttachShader(prog, comp);
+    glLinkProgram(prog);
+
+    glDeleteShader(comp);
+
+    GLint success;
+    glGetProgramiv(prog, GL_LINK_STATUS, &success);
+    if (!success) {
+        char log[512];
+        glGetProgramInfoLog(prog, sizeof(log), NULL, log);
+        fprintf(stderr, "gl_renderer: compute program link failed:\n%s\n", log);
+        glDeleteProgram(prog);
+        return 0;
+    }
+
+    return prog;
+}
+
+static void create_output_texture(struct gl_renderer *r)
+{
+    if (r->output_texture)
+        glDeleteTextures(1, &r->output_texture);
+
+    glGenTextures(1, &r->output_texture);
+    glBindTexture(GL_TEXTURE_2D, r->output_texture);
+    glTexStorage2D(GL_TEXTURE_2D, 1, GL_RGBA8, r->width, r->height);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glBindTexture(GL_TEXTURE_2D, 0);
+}
+
 gl_renderer *gl_renderer_create(int width, int height)
 {
     gl_renderer *r = calloc(1, sizeof(*r));
@@ -120,19 +158,36 @@ gl_renderer *gl_renderer_create(int width, int height)
     r->width = width;
     r->height = height;
 
-    /* Compile and link shaders */
-    GLuint vert = compile_shader(GL_VERTEX_SHADER, "shaders/raymarch.vert");
-    GLuint frag = compile_shader(GL_FRAGMENT_SHADER, "shaders/raymarch.frag");
-    if (!vert || !frag) {
+    /* Compute shader for raymarching */
+    GLuint comp = compile_shader(GL_COMPUTE_SHADER, "shaders/raymarch.comp");
+    if (!comp) {
         free(r);
         return NULL;
     }
 
-    r->program = link_program(vert, frag);
-    if (!r->program) {
+    r->compute_program = link_compute_program(comp);
+    if (!r->compute_program) {
         free(r);
         return NULL;
     }
+
+    /* Display pass: fullscreen quad samples compute output */
+    GLuint vert = compile_shader(GL_VERTEX_SHADER, "shaders/display.vert");
+    GLuint frag = compile_shader(GL_FRAGMENT_SHADER, "shaders/display.frag");
+    if (!vert || !frag) {
+        glDeleteProgram(r->compute_program);
+        free(r);
+        return NULL;
+    }
+
+    r->display_program = link_program(vert, frag);
+    if (!r->display_program) {
+        glDeleteProgram(r->compute_program);
+        free(r);
+        return NULL;
+    }
+
+    create_output_texture(r);
 
     /* Fullscreen quad: two triangles, NDC coordinates */
     float vertices[] = {
@@ -164,8 +219,12 @@ void gl_renderer_destroy(gl_renderer *r)
         glDeleteVertexArrays(1, &r->vao);
     if (r->vbo)
         glDeleteBuffers(1, &r->vbo);
-    if (r->program)
-        glDeleteProgram(r->program);
+    if (r->output_texture)
+        glDeleteTextures(1, &r->output_texture);
+    if (r->compute_program)
+        glDeleteProgram(r->compute_program);
+    if (r->display_program)
+        glDeleteProgram(r->display_program);
     free(r);
 }
 
@@ -174,22 +233,33 @@ void gl_renderer_draw(gl_renderer *r, float time_s, const camera_t *cam)
     if (!r || !r->ok)
         return;
 
-    glClearColor(0.1f, 0.1f, 0.15f, 1.0f);
-    glClear(GL_COLOR_BUFFER_BIT);
-
-    glUseProgram(r->program);
-    glUniform2f(glGetUniformLocation(r->program, "u_resolution"),
+    /* Compute pass: raymarch into output texture */
+    glUseProgram(r->compute_program);
+    glUniform2f(glGetUniformLocation(r->compute_program, "u_resolution"),
                 (float)r->width, (float)r->height);
-    glUniform1f(glGetUniformLocation(r->program, "u_time"), time_s);
+    glUniform1f(glGetUniformLocation(r->compute_program, "u_time"), time_s);
 
     if (cam) {
         float fwd[3], right[3], up[3];
         camera_basis(cam, fwd, right, up);
-        glUniform3fv(glGetUniformLocation(r->program, "u_camera_pos"), 1, cam->pos);
-        glUniform3fv(glGetUniformLocation(r->program, "u_camera_forward"), 1, fwd);
-        glUniform3fv(glGetUniformLocation(r->program, "u_camera_right"), 1, right);
-        glUniform3fv(glGetUniformLocation(r->program, "u_camera_up"), 1, up);
+        glUniform3fv(glGetUniformLocation(r->compute_program, "u_camera_pos"), 1, cam->pos);
+        glUniform3fv(glGetUniformLocation(r->compute_program, "u_camera_forward"), 1, fwd);
+        glUniform3fv(glGetUniformLocation(r->compute_program, "u_camera_right"), 1, right);
+        glUniform3fv(glGetUniformLocation(r->compute_program, "u_camera_up"), 1, up);
     }
+
+    glBindImageTexture(0, r->output_texture, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA8);
+    glDispatchCompute((r->width + 7) / 8, (r->height + 7) / 8, 1);
+    glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT);
+
+    /* Display pass: fullscreen quad samples output */
+    glClearColor(0.1f, 0.1f, 0.15f, 1.0f);
+    glClear(GL_COLOR_BUFFER_BIT);
+
+    glUseProgram(r->display_program);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, r->output_texture);
+    glUniform1i(glGetUniformLocation(r->display_program, "u_image"), 0);
 
     glViewport(0, 0, r->width, r->height);
     glBindVertexArray(r->vao);
@@ -203,6 +273,7 @@ void gl_renderer_resize(gl_renderer *r, int width, int height)
         return;
     r->width = width;
     r->height = height;
+    create_output_texture(r);
 }
 
 bool gl_renderer_reload_shaders(gl_renderer *r)
@@ -210,17 +281,31 @@ bool gl_renderer_reload_shaders(gl_renderer *r)
     if (!r || !r->ok)
         return false;
 
-    GLuint vert = compile_shader(GL_VERTEX_SHADER, "shaders/raymarch.vert");
-    GLuint frag = compile_shader(GL_FRAGMENT_SHADER, "shaders/raymarch.frag");
-    if (!vert || !frag)
+    GLuint comp = compile_shader(GL_COMPUTE_SHADER, "shaders/raymarch.comp");
+    if (!comp)
         return false;
 
-    GLuint new_prog = link_program(vert, frag);
-    if (!new_prog)
+    GLuint new_comp = link_compute_program(comp);
+    if (!new_comp)
         return false;
 
-    glDeleteProgram(r->program);
-    r->program = new_prog;
+    GLuint vert = compile_shader(GL_VERTEX_SHADER, "shaders/display.vert");
+    GLuint frag = compile_shader(GL_FRAGMENT_SHADER, "shaders/display.frag");
+    if (!vert || !frag) {
+        glDeleteProgram(new_comp);
+        return false;
+    }
+
+    GLuint new_disp = link_program(vert, frag);
+    if (!new_disp) {
+        glDeleteProgram(new_comp);
+        return false;
+    }
+
+    glDeleteProgram(r->compute_program);
+    glDeleteProgram(r->display_program);
+    r->compute_program = new_comp;
+    r->display_program = new_disp;
     fprintf(stderr, "Shaders reloaded successfully.\n");
     return true;
 }

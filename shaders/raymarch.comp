@@ -1,0 +1,324 @@
+#version 430 core
+
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(binding = 0, rgba8) uniform image2D u_output;
+
+uniform vec2 u_resolution;
+uniform float u_time;
+uniform vec3 u_camera_pos;
+uniform vec3 u_camera_forward;
+uniform vec3 u_camera_right;
+uniform vec3 u_camera_up;
+
+/* ---- Shading ---- */
+
+vec3 lambert(vec3 pos, vec3 normal, vec3 light_pos, vec3 base_color)
+{
+    vec3 d = normalize(light_pos - pos);
+    float intensity = max(0.0, dot(d, normal));
+    return intensity * base_color;
+}
+
+/* SDF result with material color for per-primitive coloring */
+struct SDFHit {
+    float d;
+    vec3 color;
+};
+
+/* ---- SDF Primitives (Straight from Inigo Quilez) ---- */
+
+float dot2(vec2 v) {return dot(v, v);}
+
+float sdf_sphere(vec3 p, float radius)
+{
+    return length(p) - radius;
+}
+
+float sdf_box(vec3 p, vec3 b)
+{
+    vec3 q = abs(p) - b;
+    return length(max(q,0.0)) + min(max(q.x,max(q.y,q.z)),0.0);
+}
+
+float sdf_capped_cone(vec3 p, float h, float r1, float r2)
+{
+    vec2 q = vec2( length(p.xz), p.y );
+    vec2 k1 = vec2(r2,h);
+    vec2 k2 = vec2(r2-r1,2.0*h);
+    vec2 ca = vec2(q.x-min(q.x,(q.y<0.0)?r1:r2), abs(q.y)-h);
+    vec2 cb = q - k1 + k2*clamp( dot(k1-q,k2)/dot2(k2), 0.0, 1.0 );
+    float s = (cb.x<0.0 && ca.y<0.0) ? -1.0 : 1.0;
+    return s*sqrt( min(dot2(ca),dot2(cb)) );
+}
+
+float sdf_torus( vec3 p, vec2 t )
+{
+  vec2 q = vec2(length(p.xz)-t.x,p.y);
+  return length(q)-t.y;
+}
+
+/* Primitive variants that return SDFHit (distance + color) */
+SDFHit sdf_sphere_color(vec3 p, float radius, vec3 color)
+{
+    return SDFHit(sdf_sphere(p, radius), color);
+}
+
+SDFHit sdf_box_color(vec3 p, vec3 b, vec3 color)
+{
+    return SDFHit(sdf_box(p, b), color);
+}
+
+SDFHit sdf_capped_cone_color(vec3 p, float h, float r1, float r2, vec3 color)
+{
+    return SDFHit(sdf_capped_cone(p, h, r1, r2), color);
+}
+
+SDFHit sdf_torus_color(vec3 p, vec2 t, vec3 color) {
+    return SDFHit(sdf_torus(p, t), color);
+}
+
+/* ---- SDF Operations (Also straight from Inigo Quilez) ---- */
+
+/* Rotate point around Y axis by angle (radians). To rotate an SDF, apply inverse
+   rotation to the sample point: sdf_box(rotate_y(pos - center, -angle), size) */
+vec3 rotate_y(vec3 p, float angle)
+{
+    float c = cos(angle), s = sin(angle);
+    return vec3(p.x * c + p.z * s, p.y, -p.x * s + p.z * c);
+}
+
+float opUnion( float a, float b ) { return min(a,b); }
+float opSubtraction( float a, float b ) { return max(-a,b); }
+float opIntersection( float a, float b ) { return max(a,b); }
+
+SDFHit opUnion(SDFHit a, SDFHit b) { return (a.d < b.d) ? a : b; }
+SDFHit opSubtraction(SDFHit a, SDFHit b) { return SDFHit(max(a.d, -b.d), a.color); }
+SDFHit opIntersection(SDFHit a, SDFHit b) { return SDFHit(max(a.d, b.d), b.color); }
+
+float opSmoothUnion( float a, float b, float k )
+{
+    k *= 4.0;
+    float h = max(k-abs(a-b),0.0);
+    return min(a, b) - h*h*0.25/k;
+}
+
+SDFHit opSmoothUnion(SDFHit a, SDFHit b, float k)
+{
+    k *= 4.0;
+    float h = max(k - abs(a.d - b.d), 0.0);
+    float d = min(a.d, b.d) - h*h*0.25/k;
+    float t = clamp(0.5 + 0.5*(b.d - a.d)/k, 0.0, 1.0);
+    vec3 col = mix(a.color, b.color, 1 - t);
+    return SDFHit(d, col);
+}
+
+SDFHit opSmoothSubtraction(SDFHit a, SDFHit b, float k)
+{
+    SDFHit neg_a = SDFHit(-a.d, a.color);
+    SDFHit u = opSmoothUnion(neg_a, b, k);
+    return SDFHit(-u.d, a.color);
+}
+
+/* Custom models */
+SDFHit sdf_pawn(vec3 pos, mat3 rot, vec3 color) {
+    SDFHit base = sdf_capped_cone_color(pos, 0.1, 0.5, 0.5, color);
+    SDFHit base2 = sdf_capped_cone_color(pos - vec3(0.0, 0.2, 0.0), 0.15, 0.32, 0.32, color);
+    SDFHit ring = sdf_torus_color(pos - vec3(0., 0.05, 0.), vec2(0.48, 0.05), color);
+    SDFHit neck = sdf_capped_cone_color(pos - vec3(0.0, 0.6, 0.0), 0.4, 0.4, 0.2, color);
+    SDFHit neck2 = sdf_capped_cone_color(pos - vec3(0.0, 1., 0.0), 0.03, 0.3, 0.3, color);
+    SDFHit head = sdf_sphere_color(pos - vec3(0.0, 1.3, 0.0), 0.3, color);
+
+    SDFHit res = base;
+    res = opSmoothUnion(res, base2, 0.01);
+    res = opSmoothSubtraction(res, ring, 0.02);
+    res = opSmoothUnion(res, neck, 0.1);
+    res = opSmoothUnion(res, neck2, 0.05);
+    res = opSmoothUnion(res, head, 0.02);
+    return res;
+}
+
+SDFHit sdf_rook(vec3 pos, mat3 rot, vec3 color) {
+    SDFHit base = sdf_capped_cone_color(pos, 0.1, 0.5, 0.5, color);
+    SDFHit base2 = sdf_capped_cone_color(pos - vec3(0.0, 0.2, 0.0), 0.15, 0.32, 0.32, color);
+    SDFHit ring = sdf_torus_color(pos - vec3(0., 0.05, 0.), vec2(0.48, 0.05), color);
+    SDFHit neck = sdf_capped_cone_color(pos - vec3(0.0, 0.6, 0.0), 0.4, 0.4, 0.2, color);
+    SDFHit neck2 = sdf_capped_cone_color(pos - vec3(0.0, 1., 0.0), 0.03, 0.3, 0.3, color);
+    SDFHit neck3 = sdf_capped_cone_color(pos - vec3(0.0, 1.15, 0.0), 0.15, 0.2, 0.28, color);
+    SDFHit head = sdf_capped_cone_color(pos - vec3(0.0, 1.3, 0.0), 0.05, 0.28, 0.28, color);
+    SDFHit crown = sdf_torus_color(pos - vec3(0., 1.4, 0.), vec2(0.255, 0.05), color);
+
+    const float PI = 3.14159265;
+    for (int i = 0; i < 6; i++)
+    {
+        float angle = float(i) * PI / 3.0;
+        vec3 gap_center = vec3(0, 1.4, 0);
+        vec3 p_local = rotate_y(pos - gap_center, -angle);
+        SDFHit gap = sdf_box_color(p_local, vec3(0.34, 0.12, 0.05), color);
+        crown = opSmoothSubtraction(crown, gap, 0.008);
+    }
+
+    SDFHit res = base;
+    res = opSmoothUnion(res, base2, 0.01);
+    res = opSmoothSubtraction(res, ring, 0.02);
+    res = opSmoothUnion(res, neck, 0.1);
+    res = opSmoothUnion(res, neck2, 0.05);
+    res = opSmoothUnion(res, neck3, 0.02);
+    res = opSmoothUnion(res, head, 0.02);
+    res = opSmoothUnion(res, crown, 0.02);
+    return res;
+}
+
+/* Scene SDF */
+/* This is where you design your scene */
+SDFHit scene_sdf(vec3 pos)
+{
+    SDFHit res;
+
+    SDFHit plane = sdf_box_color(pos - vec3(0.0, -1.5, 0.0), vec3(100., 0.5, 100.0), vec3(0.35, 0.35, 0.4));
+    res = plane;
+
+    // vec3 knight_pos = vec3(0.0, -1.0, -3.0);
+    // SDFHit knight = sdf_knight(pos - knight_pos, mat3(1.0), vec3(1.0, 1.0, 1.0));
+    
+    // -7 -> 8 is all 8 pieces
+    for (float i = -1; i < 2; i+=2) {
+        vec3 pawn_pos = vec3(i, -1.0, -5.0);
+        SDFHit pawn = sdf_pawn(pos - pawn_pos, mat3(1.0), vec3(1.0));
+        res = opUnion(res, pawn);
+    }
+
+    vec3 rook_pos = vec3(0.0, -1.0, -3.0);
+    SDFHit rook = sdf_rook(pos - rook_pos, mat3(1.0), vec3(1.0));
+    res = opUnion(res, rook);
+
+    return res;
+}
+
+vec3 calc_normal(vec3 p)
+{
+    const float eps = 0.0001;
+    vec3 n;
+    n.x = scene_sdf(p + vec3(eps, 0.0, 0.0)).d - scene_sdf(p - vec3(eps, 0.0, 0.0)).d;
+    n.y = scene_sdf(p + vec3(0.0, eps, 0.0)).d - scene_sdf(p - vec3(0.0, eps, 0.0)).d;
+    n.z = scene_sdf(p + vec3(0.0, 0.0, eps)).d - scene_sdf(p - vec3(0.0, 0.0, eps)).d;
+    return normalize(n);
+}
+
+void raymarch(vec3 origin, vec3 dir, out bool hit, out vec3 hit_pos, out vec3 hit_normal, out vec3 hit_color)
+{
+    hit = false;
+    hit_pos = vec3(0.0);
+    hit_normal = vec3(0.0, 1.0, 0.0);
+    hit_color = vec3(1.0);
+
+    const int MAX_STEPS = 128;
+    const float threshold = 0.001;
+    const float max_dist = 100.0;
+
+    float dist = 0.0;
+    for (int step = 0; step < MAX_STEPS; step++)
+    {
+        vec3 p = origin + dist * dir;
+        SDFHit h = scene_sdf(p);
+
+        if (h.d < threshold)
+        {
+            hit = true;
+            hit_pos = p;
+            hit_normal = calc_normal(p);
+            hit_color = h.color;
+            return;
+        }
+
+        dist += h.d;
+        if (dist > max_dist)
+            break;
+    }
+}
+
+/* Ambient occlusion: sample SDF along normal to estimate how much geometry blocks ambient light */
+float calc_ao(vec3 pos, vec3 normal)
+{
+    float occ = 0.0;
+    float scale = 1.0;
+    for (int i = 0; i < 5; i++)
+    {
+        float hr = 0.01 + 0.02 * float(i);
+        vec3 aopos = pos + normal * hr;
+        float d = scene_sdf(aopos).d;
+        occ += (hr - d) * scale;
+        scale *= 0.75;
+    }
+    return 1.0 - clamp(occ, 0.0, 1.0);
+}
+
+float shadow_ray(vec3 origin, vec3 dir, float max_dist)
+{
+    const int MAX_STEPS = 64;
+    const float threshold = 0.001;
+    const float k = 32.0;
+
+    float dist = 0.0;
+    float soft = 1.0;
+
+    for (int step = 0; step < MAX_STEPS; step++)
+    {
+        if (dist >= max_dist)
+            return soft;
+
+        vec3 p = origin + dist * dir;
+        float d = scene_sdf(p).d;
+
+        if (d < threshold)
+            return 0.0;
+
+        soft = min(soft, k * d / max(dist, 0.001));
+        dist += d;
+    }
+    return soft;
+}
+
+void main()
+{
+    ivec2 coord = ivec2(gl_GlobalInvocationID.xy);
+    if (coord.x >= int(u_resolution.x) || coord.y >= int(u_resolution.y))
+        return;
+
+    vec2 resolution = u_resolution;
+    float aspect = resolution.x / resolution.y;
+
+    float u = (float(coord.x) + 0.5) / resolution.x;
+    float v = (float(coord.y) + 0.5) / resolution.y;
+    u = 2.0 * u - 1.0;
+    v = 2.0 * v - 1.0;
+    u *= aspect;
+
+    vec3 origin = u_camera_pos;
+    vec3 dir = normalize(u * u_camera_right + v * u_camera_up + u_camera_forward);
+
+    bool hit;
+    vec3 hit_pos;
+    vec3 hit_normal;
+    vec3 hit_color;
+    raymarch(origin, dir, hit, hit_pos, hit_normal, hit_color);
+
+    vec4 col;
+    if (hit)
+    {
+        vec3 light_pos = vec3(5., 10., 3.);
+        vec3 to_light = light_pos - hit_pos;
+        float light_dist = length(to_light);
+        vec3 shadow_origin = hit_pos + hit_normal * 0.001;
+        vec3 shadow_dir = normalize(to_light);
+        float shadow = shadow_ray(shadow_origin, shadow_dir, light_dist - 0.002);
+        float ao = calc_ao(hit_pos, hit_normal);
+
+        col = vec4(lambert(hit_pos, hit_normal, light_pos, hit_color) * shadow * ao, 1.0);
+    }
+    else
+    {
+        col = vec4(0.15, 0.15, 0.2, 1.0);
+    }
+
+    imageStore(u_output, coord, col);
+}
